@@ -1,7 +1,15 @@
 #[cfg(target_os = "macos")]
 mod metal_impl {
     use crate::tensor::Tensor;
-    use metal::{Device, MTLResourceOptions, MTLSize};
+    use metal::{Device, MTLResourceOptions};
+    use objc2::ffi::NSUInteger;
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject, Bool};
+    use objc2::{class, msg_send, msg_send_id};
+    use std::ptr::NonNull;
+
+    #[link(name = "MetalPerformanceShaders", kind = "framework")]
+    extern "C" {}
 
     pub struct MetalContext {
         device: Device,
@@ -19,11 +27,6 @@ mod metal_impl {
             })
         }
 
-        pub fn is_available(&self) -> bool {
-            true
-        }
-
-        /// Matrix multiplication using MPS (Metal Performance Shaders)
         pub fn matmul(&self, a: &Tensor, b: &Tensor) -> Option<Tensor> {
             if a.ndim() != 2 || b.ndim() != 2 || a.shape[1] != b.shape[0] {
                 return None;
@@ -38,10 +41,10 @@ mod metal_impl {
                 return None;
             }
 
-            self.execute_matmul(&a.data, &b.data, m, k, n)
+            self.execute_mps_matmul(&a.data, &b.data, m, k, n)
         }
 
-        fn execute_matmul(
+        fn execute_mps_matmul(
             &self,
             a: &[f32],
             b: &[f32],
@@ -49,73 +52,141 @@ mod metal_impl {
             k: usize,
             n: usize,
         ) -> Option<Tensor> {
-            let a_size = (a.len() * std::mem::size_of::<f32>()) as u64;
-            let b_size = (b.len() * std::mem::size_of::<f32>()) as u64;
-            let c_size = (m * n * std::mem::size_of::<f32>()) as u64;
+            unsafe {
+                let a_size = (a.len() * std::mem::size_of::<f32>()) as u64;
+                let b_size = (b.len() * std::mem::size_of::<f32>()) as u64;
+                let c_size = (m * n * std::mem::size_of::<f32>()) as u64;
 
-            // Create buffers
-            let a_buffer = self.device.new_buffer_with_data(
-                a.as_ptr() as *const _,
-                a_size,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let b_buffer = self.device.new_buffer_with_data(
-                b.as_ptr() as *const _,
-                b_size,
-                MTLResourceOptions::StorageModeShared,
-            );
-            let c_buffer = self
-                .device
-                .new_buffer(c_size, MTLResourceOptions::StorageModeShared);
+                // Create Metal buffers
+                let a_buffer = self.device.new_buffer_with_data(
+                    a.as_ptr() as *const _,
+                    a_size,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let b_buffer = self.device.new_buffer_with_data(
+                    b.as_ptr() as *const _,
+                    b_size,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                let c_buffer = self
+                    .device
+                    .new_buffer(c_size, MTLResourceOptions::StorageModeShared);
 
-            // Create MPS matrix descriptors
-            let a_desc = metal::MPSMatrixDescriptor::new(
-                m as u64,
-                k as u64,
-                (k * std::mem::size_of::<f32>()) as u64,
-                metal::MPSDataType::Float32,
-            );
-            let b_desc = metal::MPSMatrixDescriptor::new(
-                k as u64,
-                n as u64,
-                (n * std::mem::size_of::<f32>()) as u64,
-                metal::MPSDataType::Float32,
-            );
-            let c_desc = metal::MPSMatrixDescriptor::new(
-                m as u64,
-                n as u64,
-                (n * std::mem::size_of::<f32>()) as u64,
-                metal::MPSDataType::Float32,
-            );
+                // MPSDataTypeFloat32 = 0x10000000 | 32
+                let float32_type: u32 = 0x10000000 | 32;
 
-            // Create MPS matrices
-            let a_matrix = metal::MPSMatrix::init_with_buffer_descriptor(&a_buffer, 0, &a_desc);
-            let b_matrix = metal::MPSMatrix::init_with_buffer_descriptor(&b_buffer, 0, &b_desc);
-            let c_matrix = metal::MPSMatrix::init_with_buffer_descriptor(&c_buffer, 0, &c_desc);
+                // Create matrix descriptors
+                let a_row_bytes = (k * std::mem::size_of::<f32>()) as NSUInteger;
+                let b_row_bytes = (n * std::mem::size_of::<f32>()) as NSUInteger;
+                let c_row_bytes = (n * std::mem::size_of::<f32>()) as NSUInteger;
 
-            // Create and encode matrix multiplication
-            let matmul = metal::MPSMatrixMultiplication::init(
-                &self.device,
-                false, // transpose left
-                false, // transpose right
-                m as u64,
-                n as u64,
-                k as u64,
-                1.0, // alpha
-                0.0, // beta
-            );
+                let desc_class = class!(MPSMatrixDescriptor);
 
-            let command_buffer = self.command_queue.new_command_buffer();
-            matmul.encode_to_command_buffer(command_buffer, &a_matrix, &b_matrix, &c_matrix);
+                let a_desc: Retained<AnyObject> = msg_send_id![
+                    desc_class,
+                    matrixDescriptorWithRows: m as NSUInteger,
+                    columns: k as NSUInteger,
+                    rowBytes: a_row_bytes,
+                    dataType: float32_type
+                ];
 
-            command_buffer.commit();
-            command_buffer.wait_until_completed();
+                let b_desc: Retained<AnyObject> = msg_send_id![
+                    desc_class,
+                    matrixDescriptorWithRows: k as NSUInteger,
+                    columns: n as NSUInteger,
+                    rowBytes: b_row_bytes,
+                    dataType: float32_type
+                ];
 
-            // Read results
-            let c_ptr = c_buffer.contents() as *const f32;
-            let c_data: Vec<f32> = unsafe { std::slice::from_raw_parts(c_ptr, m * n).to_vec() };
+                let c_desc: Retained<AnyObject> = msg_send_id![
+                    desc_class,
+                    matrixDescriptorWithRows: m as NSUInteger,
+                    columns: n as NSUInteger,
+                    rowBytes: c_row_bytes,
+                    dataType: float32_type
+                ];
 
-            Some(Tensor::new(c_data, vec![m, n]))
+                // Create MPS matrices
+                let matrix_class = class!(MPSMatrix);
+
+                let a_buffer_ptr = a_buffer.as_ptr();
+                let b_buffer_ptr = b_buffer.as_ptr();
+                let c_buffer_ptr = c_buffer.as_ptr();
+
+                let a_matrix: Retained<AnyObject> = msg_send_id![
+                    matrix_class,
+                    alloc
+                ];
+                let a_matrix: Retained<AnyObject> = msg_send_id![
+                    a_matrix,
+                    initWithBuffer: a_buffer_ptr,
+                    offset: 0 as NSUInteger,
+                    descriptor: &*a_desc
+                ];
+
+                let b_matrix: Retained<AnyObject> = msg_send_id![
+                    matrix_class,
+                    alloc
+                ];
+                let b_matrix: Retained<AnyObject> = msg_send_id![
+                    b_matrix,
+                    initWithBuffer: b_buffer_ptr,
+                    offset: 0 as NSUInteger,
+                    descriptor: &*b_desc
+                ];
+
+                let c_matrix: Retained<AnyObject> = msg_send_id![
+                    matrix_class,
+                    alloc
+                ];
+                let c_matrix: Retained<AnyObject> = msg_send_id![
+                    c_matrix,
+                    initWithBuffer: c_buffer_ptr,
+                    offset: 0 as NSUInteger,
+                    descriptor: &*c_desc
+                ];
+
+                // Create matrix multiplication kernel
+                let matmul_class = class!(MPSMatrixMultiplication);
+                let device_ptr = self.device.as_ptr();
+
+                let matmul: Retained<AnyObject> = msg_send_id![
+                    matmul_class,
+                    alloc
+                ];
+                let matmul: Retained<AnyObject> = msg_send_id![
+                    matmul,
+                    initWithDevice: device_ptr,
+                    transposeLeft: Bool::NO,
+                    transposeRight: Bool::NO,
+                    resultRows: m as NSUInteger,
+                    resultColumns: n as NSUInteger,
+                    interiorColumns: k as NSUInteger,
+                    alpha: 1.0f64,
+                    beta: 0.0f64
+                ];
+
+                // Encode and execute
+                let command_buffer = self.command_queue.new_command_buffer();
+                let cmd_buf_ptr = command_buffer.as_ptr();
+
+                let _: () = msg_send![
+                    &*matmul,
+                    encodeToCommandBuffer: cmd_buf_ptr,
+                    leftMatrix: &*a_matrix,
+                    rightMatrix: &*b_matrix,
+                    resultMatrix: &*c_matrix
+                ];
+
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+
+                // Read results
+                let c_ptr = c_buffer.contents() as *const f32;
+                let c_data: Vec<f32> = std::slice::from_raw_parts(c_ptr, m * n).to_vec();
+
+                Some(Tensor::new(c_data, vec![m, n]))
+            }
         }
     }
 }
@@ -130,10 +201,6 @@ pub struct MetalContext;
 impl MetalContext {
     pub fn new() -> Option<Self> {
         None
-    }
-
-    pub fn is_available(&self) -> bool {
-        false
     }
 
     pub fn matmul(
@@ -152,19 +219,9 @@ impl Default for MetalContext {
     }
 }
 
-pub fn has_metal_support() -> bool {
-    cfg!(target_os = "macos")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_has_metal_support() {
-        let expected = cfg!(target_os = "macos");
-        assert_eq!(has_metal_support(), expected);
-    }
 
     #[test]
     #[cfg(not(target_os = "macos"))]
