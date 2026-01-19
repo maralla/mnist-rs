@@ -1,7 +1,7 @@
 mnist-rs
 ========
 
-Handwritten digit recognition neural network implemented in pure Rust trains on MNIST dataset.
+Handwritten digit recognition neural network built from scratch in Rust, trained on the MNIST dataset.
 
 ## Quick Start
 
