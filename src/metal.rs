@@ -1,15 +1,14 @@
 #[cfg(target_os = "macos")]
 mod metal_impl {
     use crate::tensor::Tensor;
+    use metal::foreign_types::{ForeignType, ForeignTypeRef};
     use metal::{Device, MTLResourceOptions};
     use objc2::ffi::NSUInteger;
-    use objc2::rc::Retained;
-    use objc2::runtime::{AnyClass, AnyObject, Bool};
-    use objc2::{class, msg_send, msg_send_id};
-    use std::ptr::NonNull;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{class, msg_send};
 
     #[link(name = "MetalPerformanceShaders", kind = "framework")]
-    extern "C" {}
+    unsafe extern "C" {}
 
     pub struct MetalContext {
         device: Device,
@@ -82,7 +81,7 @@ mod metal_impl {
 
                 let desc_class = class!(MPSMatrixDescriptor);
 
-                let a_desc: Retained<AnyObject> = msg_send_id![
+                let a_desc: *mut AnyObject = msg_send![
                     desc_class,
                     matrixDescriptorWithRows: m as NSUInteger,
                     columns: k as NSUInteger,
@@ -90,7 +89,7 @@ mod metal_impl {
                     dataType: float32_type
                 ];
 
-                let b_desc: Retained<AnyObject> = msg_send_id![
+                let b_desc: *mut AnyObject = msg_send![
                     desc_class,
                     matrixDescriptorWithRows: k as NSUInteger,
                     columns: n as NSUInteger,
@@ -98,7 +97,7 @@ mod metal_impl {
                     dataType: float32_type
                 ];
 
-                let c_desc: Retained<AnyObject> = msg_send_id![
+                let c_desc: *mut AnyObject = msg_send![
                     desc_class,
                     matrixDescriptorWithRows: m as NSUInteger,
                     columns: n as NSUInteger,
@@ -106,56 +105,44 @@ mod metal_impl {
                     dataType: float32_type
                 ];
 
-                // Create MPS matrices
+                // Create MPS matrices - cast buffer pointers to *mut AnyObject
                 let matrix_class = class!(MPSMatrix);
 
-                let a_buffer_ptr = a_buffer.as_ptr();
-                let b_buffer_ptr = b_buffer.as_ptr();
-                let c_buffer_ptr = c_buffer.as_ptr();
+                let a_buffer_ptr = a_buffer.as_ptr() as *mut AnyObject;
+                let b_buffer_ptr = b_buffer.as_ptr() as *mut AnyObject;
+                let c_buffer_ptr = c_buffer.as_ptr() as *mut AnyObject;
 
-                let a_matrix: Retained<AnyObject> = msg_send_id![
-                    matrix_class,
-                    alloc
-                ];
-                let a_matrix: Retained<AnyObject> = msg_send_id![
+                let a_matrix: *mut AnyObject = msg_send![matrix_class, alloc];
+                let a_matrix: *mut AnyObject = msg_send![
                     a_matrix,
                     initWithBuffer: a_buffer_ptr,
                     offset: 0 as NSUInteger,
-                    descriptor: &*a_desc
+                    descriptor: a_desc
                 ];
 
-                let b_matrix: Retained<AnyObject> = msg_send_id![
-                    matrix_class,
-                    alloc
-                ];
-                let b_matrix: Retained<AnyObject> = msg_send_id![
+                let b_matrix: *mut AnyObject = msg_send![matrix_class, alloc];
+                let b_matrix: *mut AnyObject = msg_send![
                     b_matrix,
                     initWithBuffer: b_buffer_ptr,
                     offset: 0 as NSUInteger,
-                    descriptor: &*b_desc
+                    descriptor: b_desc
                 ];
 
-                let c_matrix: Retained<AnyObject> = msg_send_id![
-                    matrix_class,
-                    alloc
-                ];
-                let c_matrix: Retained<AnyObject> = msg_send_id![
+                let c_matrix: *mut AnyObject = msg_send![matrix_class, alloc];
+                let c_matrix: *mut AnyObject = msg_send![
                     c_matrix,
                     initWithBuffer: c_buffer_ptr,
                     offset: 0 as NSUInteger,
-                    descriptor: &*c_desc
+                    descriptor: c_desc
                 ];
 
-                // Create matrix multiplication kernel
+                // Create matrix multiplication kernel - cast device pointer
                 let matmul_class = class!(MPSMatrixMultiplication);
-                let device_ptr = self.device.as_ptr();
+                let device_ptr = self.device.as_ptr() as *mut AnyObject;
 
-                let matmul: Retained<AnyObject> = msg_send_id![
-                    matmul_class,
-                    alloc
-                ];
-                let matmul: Retained<AnyObject> = msg_send_id![
-                    matmul,
+                let matmul_kernel: *mut AnyObject = msg_send![matmul_class, alloc];
+                let matmul_kernel: *mut AnyObject = msg_send![
+                    matmul_kernel,
                     initWithDevice: device_ptr,
                     transposeLeft: Bool::NO,
                     transposeRight: Bool::NO,
@@ -166,16 +153,16 @@ mod metal_impl {
                     beta: 0.0f64
                 ];
 
-                // Encode and execute
+                // Encode and execute - cast command buffer pointer
                 let command_buffer = self.command_queue.new_command_buffer();
-                let cmd_buf_ptr = command_buffer.as_ptr();
+                let cmd_buf_ptr = command_buffer.as_ptr() as *mut AnyObject;
 
                 let _: () = msg_send![
-                    &*matmul,
+                    matmul_kernel,
                     encodeToCommandBuffer: cmd_buf_ptr,
-                    leftMatrix: &*a_matrix,
-                    rightMatrix: &*b_matrix,
-                    resultMatrix: &*c_matrix
+                    leftMatrix: a_matrix,
+                    rightMatrix: b_matrix,
+                    resultMatrix: c_matrix
                 ];
 
                 command_buffer.commit();
@@ -184,6 +171,12 @@ mod metal_impl {
                 // Read results
                 let c_ptr = c_buffer.contents() as *const f32;
                 let c_data: Vec<f32> = std::slice::from_raw_parts(c_ptr, m * n).to_vec();
+
+                // Release MPS objects (they were created with alloc/init)
+                let _: () = msg_send![a_matrix, release];
+                let _: () = msg_send![b_matrix, release];
+                let _: () = msg_send![c_matrix, release];
+                let _: () = msg_send![matmul_kernel, release];
 
                 Some(Tensor::new(c_data, vec![m, n]))
             }
@@ -221,11 +214,10 @@ impl Default for MetalContext {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     #[cfg(not(target_os = "macos"))]
     fn test_metal_context_unavailable_on_linux() {
+        use super::*;
         let ctx = MetalContext::new();
         assert!(ctx.is_none());
     }
