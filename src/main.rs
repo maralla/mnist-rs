@@ -102,7 +102,7 @@ fn cmd_train(args: &[String]) {
         Err(e) => {
             eprintln!("Failed to load training data: {}", e);
             eprintln!("Please download MNIST dataset and extract to {}", data_path);
-            eprintln!("Download from: http://yann.lecun.com/exdb/mnist/");
+            eprintln!("Run ./scripts/download_data.sh");
             process::exit(1);
         }
     };
